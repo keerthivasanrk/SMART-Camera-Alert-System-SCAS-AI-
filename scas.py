@@ -9,6 +9,16 @@ from ultralytics import YOLO
 import threading
 import customtkinter as ctk
 from PIL import Image, ImageTk
+import insightface
+from insightface.app import FaceAnalysis
+import logging
+
+# Initialize InsightFace with Buffalo_L model (High Accuracy)
+face_app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+# Disable logs for clarity
+logging.getLogger("insightface").setLevel(logging.ERROR)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # YOLOv26 will automatically download the .pt model file
 MODEL_PATH = 'yolo26n.pt'
@@ -27,87 +37,46 @@ try:
 except Exception as e:
     print(f'[SCAS] Error loading YOLOv26: {e}')
     yolo_model = None
-face_cascade = cv2.CascadeClassifier(HAAR_PATH)
-face_recognizer = cv2.face.LBPHFaceRecognizer_create(radius=1, neighbors=8, grid_x=8, grid_y=8, threshold=150.0)
-known_names = []
+known_embeddings = [] # List of {'name': str, 'embedding': np.array}
 model_trained = False
-
+MATCH_THRESHOLD = 0.65 # Optimized for InsightFace cosine similarity (higher is more lenient)
 def load_known_faces():
-    global known_names, model_trained
-    faces, labels = ([], [])
-    label_map = {}
+    """
+    Generates and stores InsightFace embeddings for all images in known_faces/.
+    """
+    global known_embeddings, model_trained
+    known_embeddings = []
     
-    # 1. Load from known_faces directory (legacy)
+    print('[SCAS] Generating high-precision embeddings...')
+    
     for root, dirs, files in os.walk(KNOWN_FACES_DIR):
         for fname in files:
             fpath = os.path.join(root, fname)
             if not fname.lower().endswith(('.jpg', '.jpeg', '.png')):
                 continue
-            img = cv2.imread(fpath)
-            if img is None: continue
             
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             name = os.path.basename(root) if os.path.abspath(root) != os.path.abspath(KNOWN_FACES_DIR) else os.path.splitext(fname)[0]
             name = ''.join([i for i in name if not i.isdigit()]).strip().rstrip('_- ')
             
-            if name not in label_map: label_map[name] = len(label_map)
-            
-            # Detect face and augment
-            detected = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(30, 30))
-            if len(detected) == 0: detected = [(0, 0, gray.shape[1], gray.shape[0])]
-            
-            for x, y, w, h in detected:
-                # Augmentation to handle different lighting
-                base_roi = cv2.resize(gray[y:y+h, x:x+w], (100, 100))
-                base_roi = cv2.equalizeHist(base_roi)
+            try:
+                img = cv2.imread(fpath)
+                faces_found = face_app.get(img)
                 
-                # Multiple versions for robustness
-                faces.append(base_roi)
-                labels.append(label_map[name])
-                faces.append(cv2.flip(base_roi, 1))
-                labels.append(label_map[name])
-                faces.append(cv2.convertScaleAbs(base_roi, alpha=0.8, beta=0)) # Darker
-                labels.append(label_map[name])
-                faces.append(cv2.convertScaleAbs(base_roi, alpha=1.2, beta=10)) # Brighter
-                labels.append(label_map[name])
+                if faces_found:
+                    # Store the 512-D embedding
+                    embedding = faces_found[0].normed_embedding
+                    known_embeddings.append({"name": name, "embedding": embedding})
+                    print(f'[SCAS] Indexed: {name} ({fname})')
+            except Exception as e:
+                print(f'[SCAS] Skipping {fname}: {e}')
 
-    # 2. Load from dataset/images_info.xlsx (New Dataset)
-    xlsx_path = os.path.join(SCRIPT_DIR, 'dataset', 'images_info.xlsx')
-    if os.path.exists(xlsx_path):
-        try:
-            import pandas as pd
-            df = pd.read_excel(xlsx_path)
-            # Expecting 'image' and 'id' or 'caption' as name
-            for _, row in df.iterrows():
-                img_name = str(row.get('image', ''))
-                if not img_name: continue
-                # Search for image in 'dataset' folder
-                found = False
-                for ext in ['', '.png', '.jpg', '.jpeg']:
-                    trial_path = os.path.join(SCRIPT_DIR, 'dataset', img_name + ext)
-                    if os.path.exists(trial_path):
-                        img = cv2.imread(trial_path)
-                        if img is not None:
-                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                            name = str(row.get('caption', 'Unknown')).split(' ')[0] # Use first word of caption as name
-                            if name not in label_map: label_map[name] = len(label_map)
-                            
-                            faces.append(cv2.resize(gray, (100, 100)))
-                            labels.append(label_map[name])
-                            found = True
-                            break
-                if found: print(f'[SCAS] Loaded {img_name} from Excel dataset as {name}')
-        except Exception as e:
-            print(f'[SCAS] Excel Load Error: {e}')
-
-    if faces:
-        known_names = [''] * len(label_map)
-        for name, lid in label_map.items(): known_names[lid] = name
-        face_recognizer.train(faces, np.array(labels, dtype=np.int32))
+    if known_embeddings:
         model_trained = True
-        print(f'[SCAS] Trained on {len(label_map)} people matching: {list(label_map.keys())}')
+        print(f'[SCAS] Ready! {len(known_embeddings)} embeddings loaded.')
     else:
+        print('[SCAS] WARNING: No known faces found.')
         model_trained = False
+
 load_known_faces()
 try:
     pb = Pushbullet('o.r6ahTiaZNgGtTxjx6vFaUNgqYfKky1AU')
@@ -132,7 +101,8 @@ class SCASApp(ctk.CTk):
         self.cleanup_complete.set()
         self._alert_cooldown = False
         self._face_history = []
-        self.COINCIDENCE_THRESHOLD = 3
+        self.COINCIDENCE_THRESHOLD = 2 # Reduced for faster detection
+        self.CONFIDENCE_THRESHOLD = 120 # Slightly looser for better detection at distance
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
         self.sidebar = ctk.CTkFrame(self, width=210, corner_radius=0)
@@ -142,14 +112,20 @@ class SCASApp(ctk.CTk):
         ctk.CTkLabel(self.sidebar, text='Smart Camera Alert System', font=ctk.CTkFont(size=10), text_color='gray').grid(row=1, column=0, padx=20, pady=(0, 10))
         self.status_label = ctk.CTkLabel(self.sidebar, text='● Inactive', text_color='#ff5555', font=ctk.CTkFont(size=13, weight='bold'))
         self.status_label.grid(row=2, column=0, padx=20, pady=6)
+        
+        ctk.CTkLabel(self.sidebar, text='Camera Source', font=ctk.CTkFont(size=12)).grid(row=3, column=0, padx=20, pady=(10, 0))
+        self.camera_option = ctk.CTkOptionMenu(self.sidebar, values=['Laptop Camera (0)', 'Phone/DroidCam (1)', 'Phone/DroidCam (2)', 'Phone/DroidCam (3)'], width=180)
+        self.camera_option.set('Phone/DroidCam (1)') # Default to Phone Cam
+        self.camera_option.grid(row=4, column=0, padx=20, pady=(0, 10))
+
         self.activate_btn = ctk.CTkButton(self.sidebar, text='▶  Activate', fg_color='#1f8a1f', hover_color='#156315', command=self.start_activation_thread)
-        self.activate_btn.grid(row=3, column=0, padx=20, pady=6)
+        self.activate_btn.grid(row=5, column=0, padx=20, pady=6)
         self.deactivate_btn = ctk.CTkButton(self.sidebar, text='■  Deactivate', fg_color='#8a1f1f', hover_color='#631515', command=self.deactivate_scas, state='disabled')
-        self.deactivate_btn.grid(row=4, column=0, padx=20, pady=6)
+        self.deactivate_btn.grid(row=6, column=0, padx=20, pady=6)
         self.known_faces_btn = ctk.CTkButton(self.sidebar, text='👤  Manage Known Faces', command=self.manage_known_faces)
-        self.known_faces_btn.grid(row=5, column=0, padx=20, pady=6)
+        self.known_faces_btn.grid(row=7, column=0, padx=20, pady=6)
         self.recordings_btn = ctk.CTkButton(self.sidebar, text='🎞  View Recordings', command=self.view_recordings)
-        self.recordings_btn.grid(row=6, column=0, padx=20, pady=6)
+        self.recordings_btn.grid(row=8, column=0, padx=20, pady=6)
         legend = ctk.CTkFrame(self.sidebar, fg_color='transparent')
         legend.grid(row=8, column=0, padx=10, pady=(10, 20), sticky='s')
         ctk.CTkLabel(legend, text='Detection Legend', font=ctk.CTkFont(size=11, weight='bold'), text_color='gray').pack(anchor='w')
@@ -198,15 +174,26 @@ class SCASApp(ctk.CTk):
     def activate_scas(self):
         global scas_active, cap, out
         try:
-            for idx in [0, 1]:
-                cap = cv2.VideoCapture(idx)
-                if cap and cap.isOpened():
-                    break
+            # Parse index from selection string (e.g., "Laptop Camera (0)" -> 0)
+            selection = self.camera_option.get()
+            import re
+            match = re.search(r'\((\d+)\)', selection)
+            target_idx = int(match.group(1)) if match else 1
+            
+            print(f'[SCAS] Activating Camera Index: {target_idx}...')
+            
+            # Use CAP_DSHOW for better compatibility on Windows
+            cap = cv2.VideoCapture(target_idx, cv2.CAP_DSHOW)
             if not cap or not cap.isOpened():
-                self.after(0, lambda: messagebox.showerror('Error', 'No camera found.'))
+                cap = cv2.VideoCapture(target_idx)
+            
+            if not cap or not cap.isOpened():
+                self.after(0, lambda: messagebox.showerror('Error', f'Failed to connect to index {target_idx}. Ensure camera is connected.'))
                 self.after(0, self.reset_ui)
                 self.cleanup_complete.set()
                 return
+            
+            print(f'[SCAS] Successfully connected to Index: {target_idx}')
             ts = int(pygame.time.get_ticks())
             record_file = os.path.join(RECORDINGS_DIR, f'scas_{ts}.avi')
             fourcc = cv2.VideoWriter_fourcc(*'XVID')
@@ -294,41 +281,39 @@ class SCASApp(ctk.CTk):
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return (False, '')
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray_roi, 1.1, 5, minSize=(20, 20))
-        
-        best_match = None
-        min_conf = float('inf')
-
-        for fx, fy, fw, fh in faces:
-            # Tighten bounding box exactly as in training
-            ty = int(fy + 0.1 * fh)
-            th = int(0.8 * fh)
-            tx = int(fx + 0.1 * fw)
-            tw = int(0.8 * fw)
-            # Ensure boundaries are within roi
-            if ty+th > gray_roi.shape[0] or tx+tw > gray_roi.shape[1]:
-                continue
-                
-            face_img = cv2.resize(gray_roi[ty:ty + th, tx:tx + tw], (100, 100))
-            face_img = cv2.equalizeHist(face_img)
-            label, confidence = face_recognizer.predict(face_img)
-            print(f'[SCAS] Face match debug: label={label}, confidence={confidence:.1f}')
             
-            # Balanced threshold: 110 is a solid middle ground.
-            # Below 100 was too strict (caused 'not detecting me' error).
-            # Above 115 is too loose (caused 'everyone is me' error).
-            if confidence < 110 and 0 <= label < len(known_names):
-                if confidence < min_conf:
-                    min_conf = confidence
-                    best_match = known_names[label]
+        try:
+            # InsightFace works best on the full ROI or even slightly padded image
+            faces_found = face_app.get(roi)
+            
+            if not faces_found:
+                self._face_history.append('NoFace')
+                return (False, '')
 
-        if best_match:
-            self._face_history.append(best_match)
-        elif len(faces) > 0:
-            self._face_history.append('Unknown')
-        else:
+            # Use the most prominent face in the ROI
+            current_embedding = faces_found[0].normed_embedding
+            best_match = None
+            max_sim = -1.0
+
+            for known in known_embeddings:
+                # InsightFace normed_embeddings use dot product for cosine similarity
+                similarity = np.dot(current_embedding, known["embedding"])
+                
+                if similarity > max_sim:
+                    max_sim = similarity
+                    if similarity > MATCH_THRESHOLD:
+                        best_match = known["name"]
+
+            if best_match:
+                print(f'[SCAS] Recognized: {best_match} (Sim: {max_sim:.3f})')
+                self._face_history.append(best_match)
+            else:
+                self._face_history.append('Unknown')
+
+        except Exception as e:
+            print(f'[SCAS] Detection error: {e}')
             self._face_history.append('NoFace')
+            return (False, '')
             
         # Keep only the last N frames of history (smooths out missed frames)
         if len(self._face_history) > 20: # store up to 20 frames
